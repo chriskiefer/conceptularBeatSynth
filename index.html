@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title>Conceptular Beat Synthesiser</title>
+  <link rel="stylesheet" type="text/css" href="csynthesis.css">
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@0.13.1"></script>
+  <script src="https://code.jquery.com/jquery-3.3.1.js" integrity="sha256-2Kok7MbOyxpgUVvAk/HJ2jigOSYS2auK4Pfzbm7uH60=" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/wavesurfer.js/2.0.6/wavesurfer.min.js"></script>
+  <!-- <script src="//cdn.jsdelivr.net/npm/pouchdb@7.0.0/dist/pouchdb.min.js"></script> -->
+  <script src="js/NexusUI.js"></script>
+  <script src="js/renderer.js"></script>
+  <script src="js/FileSaver.min.js"></script>
+  <script src="js/wav-audio-encoder-js/lib/WavAudioEncoder.min.js"></script>
+  <link rel="stylesheet" href="js/jquery-ui-1.12.1.custom/jquery-ui.min.css">
+  <link rel="stylesheet" href="js/jquery-ui-1.12.1.custom/jquery-ui.theme.min.css">
+  <script src="js/jquery-ui-1.12.1.custom/jquery-ui.min.js"></script>
+  <script>
+    let audio = [];
+    let controls = [];
+    let resultBuffer;
+    let sequencer;
+    let state = [];
+
+    state.rendering = false;
+
+    const config = {
+      modelCount: 4
+    }
+
+    function invalidateAll() {
+      for (let i = 0; i < config.modelCount; i++) state.needToRender[i] = 1;
+    };
+
+    function getParameterByName(name, url) {
+      if (!url) url = window.location.href;
+      name = name.replace(/[\[\]]/g, '\\$&');
+      var regex = new RegExp('[?&]' + name + '(=([^&#]*)|&|#|$)'),
+        results = regex.exec(url);
+      if (!results) return null;
+      if (!results[2]) return '';
+      return decodeURIComponent(results[2].replace(/\+/g, ' '));
+    }
+    $(document).ready(function() {
+      state.needToRender = [];
+      state.waveform = [];
+      for (let i = 0; i < config.modelCount; i++) state.needToRender[i] = 0;
+      if (window.AudioContext !== undefined) {
+        // if (window.AudioContext !== undefined && window.AudioWorkletNode !== undefined) {
+
+        $("#nosound").remove();
+
+        // audio.CustomAudioNode = class CustomAudioNode extends AudioWorkletNode {
+        //     constructor(audioContext, processorName) {
+        //         super(audioContext, processorName, {
+        //             numberOfInputs: 1,
+        //             numberOfOutputs: 1,
+        //             outputChannelCount: [1]
+        //         });
+        //     }
+        // };
+        //
+        audio.context = new AudioContext();
+        // audio.context.audioWorklet.addModule("noiseWorklet.js").then(() => {
+        //     audio.customNode = new audio.CustomAudioNode(audio.context, "whitenoise");
+        //
+        //     audio.customNode.connect(audio.context.destination);
+        //     audio.context.suspend();
+        // });
+        Nexus.colors.accent = "#ff0"
+        Nexus.colors.fill = "#222"
+        Nexus.colors.light = "#ccc"
+        Nexus.colors.dark = "#fff"
+        sequencer = new Nexus.Sequencer('#sequencer', {
+          'size': [window.innerWidth - 20, 200],
+          'mode': 'toggle',
+          'rows': config.modelCount,
+          'columns': 32
+        });
+        sequencer.on("change", (v) => {
+          // console.log(v);
+          state.needToRender[v.row] = 1;
+        });
+        //envelopes
+        var makeEnv = (envName, envIdx, level = 0.5) => {
+          let envDivName = envName + envIdx;
+          $("#envelopes").append("<div id=\"" + envDivName + "\"/>");
+          let newEnv = new Nexus.Envelope('#' + envDivName, {
+            'size': [window.innerWidth - 20, 150],
+            'points': [{
+                x: 0.0,
+                y: level
+              },
+              {
+                x: 1.0,
+                y: level
+              },
+            ]
+          });
+          newEnv.on("change", function(v) {
+            state.needToRender[this.envIdx] = 1;
+          }.bind({
+            envIdx: envIdx
+          }));
+          $("#" + envDivName).hide();
+          return newEnv;
+        };
+        controls.modelEnvelopes = [];
+        for (let envIdx = 0; envIdx < config.modelCount; envIdx++) {
+          controls.modelEnvelopes[envIdx] = [];
+          controls.modelEnvelopes[envIdx][ENVIDX.MORPH] = makeEnv("stretchEnv", envIdx, 1.0);
+          controls.modelEnvelopes[envIdx][ENVIDX.STRETCH] = makeEnv("morphEnv", envIdx);
+          controls.modelEnvelopes[envIdx][ENVIDX.LR] = makeEnv("lrEnv", envIdx);
+          controls.modelEnvelopes[envIdx][ENVIDX.SR] = makeEnv("srEnv", envIdx);
+          controls.modelEnvelopes[envIdx][ENVIDX.GAIN] = makeEnv("gainEnv", envIdx);
+
+          controls.modelEnvelopes[envIdx][ENVIDX.STRETCH].colorize("accent", "#f99");
+          controls.modelEnvelopes[envIdx][ENVIDX.LR].colorize("accent", "#9f9");
+          controls.modelEnvelopes[envIdx][ENVIDX.SR].colorize("accent", "#99f");
+          controls.modelEnvelopes[envIdx][ENVIDX.GAIN].colorize("accent", "#f9f");
+        }
+        controls.currModel = 0;
+        controls.currEnvelope = controls.modelEnvelopes[controls.currModel][ENVIDX.MORPH];
+        controls.currEnvelopeIdx = ENVIDX.MORPH;
+        $(controls.currEnvelope.settings.target).show();
+
+        console.log(controls.modelEnvelopes);
+
+        function setSteps(v) {
+          sequencer.columns = v;
+          invalidateAll();
+        }
+
+        controls.colControl = new Nexus.Number('#colcontrol', {
+          'size': [60, 30],
+          'value': 32,
+          'min': 3,
+          'max': 64,
+          'step': 1
+        }).on('change', function(v) {
+          setSteps(v);
+        })
+        state.stepLength = 36;
+
+        function setStepLength(v) {
+          state.stepLength = v;
+          invalidateAll();
+        }
+        controls.stepLenControl = new Nexus.Number('#steplencontrol', {
+          'size': [60, 30],
+          'value': state.stepLength,
+          'min': 0.1,
+          'max': 500,
+          'step': 0.1
+        }).on('change', function(v) {
+          setStepLength(v);
+        })
+
+        controls.modelButtons = new Array(config.modelCount);
+        controls.modelGainDials = new Array(config.modelCount);
+        let buttonOffColor = "#444";
+        for (let i = 0; i < config.modelCount; i++) {
+          const buttonName = "model" + i + "button";
+          $("#buttons").append("<span class='adjacent' id=\"" + buttonName + "\"/>")
+          let newButton = new Nexus.TextButton('#' + buttonName, {
+            'size': [120, 50],
+            'state': false,
+            'text': 'Model ' + (i + 1),
+            'alternate': false,
+          });
+          newButton.colorize("fill", buttonOffColor);
+          let onChange = function(v) {
+            console.log(this);
+            if (v) {
+              controls.modelButtons[controls.currModel].colorize("fill", buttonOffColor);
+              controls.modelButtons[controls.currModel].colorize("dark", 'white');
+              controls.currModel = this.id;
+              controls.modelButtons[controls.currModel].colorize("fill", Nexus.colors.fill);
+              controls.modelButtons[controls.currModel].colorize("dark", 'yellow');
+              setEnvelope(controls.currEnvelopeIdx);
+            }
+          };
+          newButton.on('change', onChange.bind({
+            id: i,
+            obj: newButton
+          }));
+          controls.modelButtons[i] = newButton;
+        }
+        controls.modelButtons[controls.currModel].colorize("fill", Nexus.colors.fill);
+        controls.modelButtons[controls.currModel].colorize("dark", 'yellow');
+        controls.wavesurfer = WaveSurfer.create({
+          container: '#waveform',
+          waveColor: 'white',
+          progressColor: 'yellow'
+        });
+        controls.wavesurfer.on("finish", () => {
+          controls.wavesurfer.play();
+        });
+
+        controls.renderButton = new Nexus.TextButton('#renderButton', {
+          'size': [150, 50],
+          'state': false,
+          'text': 'Render',
+          'alternate': false
+        }).on('change', function(v) {
+          if (v && !state.rendering) {
+            let renderQueue = [];
+            for (let i = 0; i < config.modelCount; i++) {
+              if (state.needToRender[i]) {
+                renderQueue.push(i);
+              }
+            }
+            if (renderQueue.length > 0) {
+              $("#playButton").hide();
+              $("#stopButton").hide();
+              $("#message").text("... rendering ...");
+              $("#messagebox").show();
+              $("#messageok").hide();
+
+              while (sequencer.stepper.value != sequencer.columns-1) sequencer.next();
+              controls.wavesurfer.stop();
+              state.rendering = true;
+
+              function renderOneModel() {
+                $("#seqLabel" + (renderQueue[0] + 1)).css("animation", "blinker 0.8s linear infinite");
+                $("#seqLabel" + (renderQueue[0] + 1)).css("color", "green");
+                render(renderQueue[0], sequencer.matrix.pattern, controls.modelEnvelopes[renderQueue[0]], state.stepLength, (v) => {
+                    state.waveform[renderQueue[0]] = v;
+                    $("#seqLabel" + (renderQueue[0] + 1)).css("animation", "");
+                    $("#seqLabel" + (renderQueue[0] + 1)).css("color", "#666666");
+                    if (renderQueue.length > 1) {
+                      renderQueue = renderQueue.slice(1);
+                      renderOneModel();
+                    } else {
+                      console.log("Mixing");
+                      resultBuffer = audio.context.createBuffer(1, v.length, 22050);
+                      let mix = resultBuffer.getChannelData(0);
+                      let mixCount = 0;
+                      for (let j = 0; j < mix.length; j++) {
+                        mix[j] = 0.0;
+                      }
+                      for (let w = 0; w < config.modelCount; w++) {
+                        if (state.waveform[w] != undefined) {
+                          mixCount++;
+                          // console.log(w);
+                          for (let j = 0; j < mix.length; j++) {
+                            mix[j] += state.waveform[w][j];
+                          }
+                        }
+                      }
+                      //normalise
+                      let maxVal = Math.max.apply(null, mix.map((mix) => Math.abs(mix)));
+                      if (maxVal > 0)
+                        mix = mix.map((x) => x / maxVal);
+
+                      // for (let j = 0; j < mix.length; j++) {
+                      //     mix[j] /= mixCount;
+                      // }
+                      // for (let i = 0; i < v.length; i++) {
+                      //     nowBuffering[i] = v[i];
+                      // }
+                      controls.wavesurfer.loadDecodedBuffer(resultBuffer);
+                      state.rendering = false;
+                      for (let i = 0; i < config.modelCount; i++) state.needToRender[i] = 0;
+                      $("#bookmarkButton").show();
+                      $("#downloadButton").show();
+                      $("#playButton").show();
+                      $("#stopButton").show();
+                      $("#messageok").show();
+                      $("#messagebox").hide();
+
+                    }
+                  },
+                  (step) => {
+                    console.log(step);
+                    sequencer.next();
+                  });
+              };
+              renderOneModel();
+
+            };
+          }
+        })
+        controls.playButton = new Nexus.TextButton('#playButton', {
+          'size': [120, 50],
+          'state': false,
+          'text': 'Play',
+          'alternate': false
+        }).on('change', function(v) {
+          console.log(v);
+          controls.wavesurfer.play();
+        })
+        controls.stopButton = new Nexus.TextButton('#stopButton', {
+          'size': [120, 50],
+          'state': false,
+          'text': 'Stop',
+          'alternate': false
+        }).on('change', function(v) {
+          console.log(v);
+          controls.wavesurfer.stop();
+        })
+        $("#playButton").hide();
+        $("#stopButton").hide();
+
+        let setEnvelope = (newEnvelopeIdx) => {
+
+          $(controls.currEnvelope.settings.target).hide();
+          controls.currEnvelope = controls.modelEnvelopes[controls.currModel][newEnvelopeIdx];
+          $(controls.currEnvelope.settings.target).show();
+          controls.currEnvelopeIdx = newEnvelopeIdx;
+          console.log(controls);
+          controls.currEnvButton.colorize("dark", 'white');
+          // controls.currEnvButton.colorize("fill", buttonOffColor);
+          controls.currEnvButton = controls.envButtons[newEnvelopeIdx];
+          // controls.currEnvButton.colorize("fill", Nexus.colors.fill);
+          controls.currEnvButton.colorize("dark", 'yellow');
+          console.log(controls);
+        };
+        controls.envButtons = [];
+        let envButtonWidth = 150;
+        let envButtonHeight = 40;
+        controls.envButtons[ENVIDX.MORPH] = new Nexus.TextButton('#ctlMorphButton', {
+          'size': [envButtonWidth, envButtonHeight],
+          'state': false,
+          'text': 'Morph',
+          'alternate': false
+        }).on('change', function(v) {
+          if (v) {
+            setEnvelope(ENVIDX.MORPH);
+          }
+        });
+        controls.envButtons[ENVIDX.STRETCH] = new Nexus.TextButton('#ctlStretchButton', {
+          'size': [envButtonWidth, envButtonHeight],
+          'state': false,
+          'text': 'Stretch',
+          'alternate': false
+        }).on('change', function(v) {
+          if (v) {
+            setEnvelope(ENVIDX.STRETCH);
+          }
+        });
+        // controls.envButtons[ENVIDX.STRETCH].colorize("fill", buttonOffColor);
+        controls.envButtons[ENVIDX.LR] = new Nexus.TextButton('#ctlLRButton', {
+          'size': [envButtonWidth, envButtonHeight],
+          'state': false,
+          'text': 'Leak Rate',
+          'alternate': false
+        }).on('change', function(v) {
+          if (v) {
+            setEnvelope(ENVIDX.LR);
+          }
+        });
+        // controls.envButtons[ENVIDX.LR].colorize("fill", buttonOffColor);
+        controls.envButtons[ENVIDX.SR] = new Nexus.TextButton('#ctlSRButton', {
+          'size': [envButtonWidth, envButtonHeight],
+          'state': false,
+          'text': 'Excite',
+          'alternate': false
+        }).on('change', function(v) {
+          if (v) {
+            setEnvelope(ENVIDX.SR);
+          }
+        });
+        // controls.envButtons[ENVIDX.SR].colorize("fill", buttonOffColor);
+        controls.envButtons[ENVIDX.GAIN] = new Nexus.TextButton('#gainButton', {
+          'size': [envButtonWidth, envButtonHeight],
+          'state': false,
+          'text': 'Gain',
+          'alternate': false
+        }).on('change', function(v) {
+          if (v) {
+            setEnvelope(ENVIDX.GAIN);
+          }
+        });
+        // controls.envButtons[ENVIDX.GAIN].colorize("fill", buttonOffColor);
+        controls.currEnvButton = controls.envButtons[ENVIDX.MORPH];
+        setEnvelope(ENVIDX.MORPH);
+        console.log(controls.envButtons);
+
+
+        controls.messageOkBtn = new Nexus.TextButton('#messageok', {
+          'size': [50, 20],
+          'state': false,
+          'text': 'OK',
+          'alternate': false
+        }).on('change', function(v) {
+          $("#messagebox").hide();
+        });
+        $("#messagebox").hide();
+
+        controls.downloadButton = new Nexus.TextButton('#downloadButton', {
+          'size': [140, 50],
+          'state': false,
+          'text': 'Download',
+          'alternate': false
+        }).on('change', function(v) {
+          if (v) {
+            let buffer = [resultBuffer.getChannelData(0)];
+            let encoder = new WavAudioEncoder(22050, 1)
+            encoder.encode(buffer);
+            let blob = encoder.finish();
+            console.log(blob);
+            console.log(encoder);
+
+            var saveData = (function() {
+              var a = document.createElement("a");
+              document.body.appendChild(a);
+              a.style = "display: none";
+              return function(blob, fileName) {
+                var url = window.URL.createObjectURL(blob);
+                a.href = url;
+                a.download = fileName;
+                a.click();
+                window.URL.revokeObjectURL(url);
+              };
+            }());
+
+
+            saveData(blob, "concepular.wav");
+          }
+
+        });
+        $("#downloadButton").hide();
+        controls.bookmarkButton = new Nexus.TextButton('#bookmarkButton', {
+          'size': [120, 50],
+          'state': false,
+          'text': 'Share',
+          'alternate': false
+        }).on('change', function(v) {
+          if (v) {
+            $("#message").text("... saving ...");
+
+            $("#messagebox").show();
+
+            saveData = {
+              steps: sequencer.columns,
+              stepLen: state.stepLength
+            };
+            saveData.modelEnvelopes = [];
+            for (let i = 0; i < controls.modelEnvelopes.length; i++) {
+              saveData.modelEnvelopes[i] = [];
+              for (let j = 0; j < controls.modelEnvelopes[i].length; j++) {
+                saveData.modelEnvelopes[i][j] = controls.modelEnvelopes[i][j].points
+              }
+            }
+            saveData.seq = sequencer.matrix.pattern;
+            // saveData.audio = resultBuffer.getChannelData(0);
+
+            console.log(saveData);
+            $.post("https://luuma.net:5799/save", saveData, function(res) {
+              console.log(res)
+              let savemessage = "This patch can be accessed from this shareable link: https://" + window.location.host + "/?id=" + res;
+              $("#message").text(savemessage);
+            })
+          };
+        });
+        $("#bookmarkButton").hide();
+        controls.presetSelect = new Nexus.Select('#presets', {
+          'size': [150, 50],
+          'options': ['Presets', 'blank', 'Techno 1', 'Disco Alarm', 'Techno 2', 'Hihats 1', "Stretched", "Jungle Morph", "Snare Transformation", "Clave Morph", "Pulse", "Gabber"]
+        })
+        controls.presetSelect.element.style.fontVariant = "small-caps";
+        controls.presetSelect.element.style.fontSize = "15px";
+        // function loadPreset(v) {
+        //   let presetUrl = "https://" + window.location.host + "/?id=" + v;
+        //   window.location.href = presetUrl;
+        // }
+        controls.presetSelect.on("change", (v) => {
+          console.log(v);
+          switch (v.index) {
+            case 1:
+              loadFromId("dbb39959-fbac-48c0-b32e-770feb299804");
+              break;
+            case 2:
+              loadFromId("c91a1d98-202b-4bd0-b273-4797d8c1fb4e");
+              break;
+            case 3:
+              loadFromId("d20a87c6-f568-4e43-b96c-16171b52932c");
+              break;
+            case 4:
+              loadFromId("e8d6f344-8614-4d51-b994-3603af1c5a37")
+              break;
+            case 5:
+              loadFromId("a8ecee6c-f1d8-418c-b666-cf905c87e041");
+              break;
+            case 6:
+              loadFromId("69054a4a-f467-4171-a351-943f62809de4");
+              break;
+            case 7:
+              loadFromId("d4385c8f-4975-4762-bd52-94b577b7861a");
+              break;
+            case 8:
+              loadFromId("4b7cbf12-d50f-4467-9f4d-efac84b43930");
+              break;
+            case 9:
+              loadFromId("66e10fd2-3bf2-42fd-a718-076f32581e79");
+              break;
+            case 10:
+              loadFromId("1fe2f470-8784-417c-bd6a-3e79fae6088b");
+              break;
+            case 11:
+              loadFromId("b6884381-c683-4f75-bad4-c7d95cb7225c");
+              break;
+          }
+          //https://localhost:8080/?id=d8fe11ef-8f3b-4867-b8fb-7a6a2b676a25 flutes
+        })
+
+        function loadFromId(idParam) {
+          $.getJSON("https://luuma.net:5799/get/" + idParam, function(data) {
+            console.log(data);
+            console.log(data.seq);
+            controls.colControl.value = data.steps;
+            controls.stepLenControl.value = data.stepLen;
+            sequencer.matrix.populate.all([0]);
+            for (let i = 0; i < config.modelCount; i++) {
+              for (let j = 0; j < sequencer.columns; j++) {
+                console.log(" " + i + "," + j);
+                if (data.seq[i][j] == "true") sequencer.matrix.toggle.cell(j, i);
+              }
+              for (let j = 0; j < controls.modelEnvelopes[0].length; j++) {
+                // for (let k = 0; k < controls.modelEnvelopes[0][0].points.length; k++)
+                //   controls.modelEnvelopes[i][j].destroyPoint(0);
+                // for (let k = 0; k < data.modelEnvelopes[i][j].length; k++)
+                //   controls.modelEnvelopes[i][j].addPoint(data.modelEnvelopes[i][j][k])
+                // controls.modelEnvelopes[i][j].setPoints([{x:0,y:1}, {x:1,y:1}]);
+                controls.modelEnvelopes[i][j].setPoints(data.modelEnvelopes[i][j]);
+                // controls.modelEnvelopes[i][j].sortPoints();
+                controls.modelEnvelopes[i][j].nodes.sort((a, b) => {
+                  return a.x - b.x
+                })
+                controls.modelEnvelopes[i][j].render();
+              }
+            }
+
+          });
+        }
+        $("#dialog").dialog({
+          autoOpen: false,
+          height: 400,
+          width: "60%"
+        });
+        // $( "#dialog" ).dialog("close");
+        controls.helpButton = new Nexus.TextButton('#helpButton', {
+          'size': [30, 30],
+          'state': false,
+          'text': '?',
+          'alternate': false
+        }).on('change', function(v) {
+          if (v) {
+            $("#dialog").dialog("open");
+          }
+        });
+        loadModels(() => {
+            let idParam = getParameterByName("id");
+            if (idParam != null) {
+              loadFromId(idParam);
+            }
+            $("#loading").hide()
+          },
+          (v) => {
+            $("#progressText").text(Math.round(v * 100.0) + "%");
+          });
+
+
+
+      } else {
+        console.log("no audiocontext")
+      }
+
+    });
+  </script>
+</head>
+
+<body>
+  <div id="nosound">Please use a browser that is compatible with webaudio</div>
+  <div id="loading">loading... <span style="adjacent" id="progressText"></span>
+    <div style="font-size:70%">
+      This will be slow the first time, and then faster afterwards.
+    </div>
+  </div>
+  <div id="titleContainer"><span id="title">CONCEPTULAR</span><span id="subtitle"> Beat Synthesiser</span></div>
+  <div class="ctlLabel">steps: <span id="colcontrol"></span> step length (ms): <span id="steplencontrol"></span><span id="helpButton"></span></div>
+  <div id="seqContainer">
+    <div id="sequencer"></div>
+    <div id="seqLabel1">Model 1: Hihats</div>
+    <div id="seqLabel2">Model 2: Clave/Triangle</div>
+    <div id="seqLabel3">Model 3: Snare/Bongo</div>
+    <div id="seqLabel4">Model 4: Kicks</div>
+  </div>
+  <div id="waveform"></div>
+  <div id="buttons"></div>
+  <div id="controllerButtons"><span class='adjacent' id="ctlMorphButton"></span><span class='adjacent' id="ctlStretchButton"></span><span class='adjacent' id="ctlLRButton"></span><span class='adjacent' id="ctlSRButton"></span><span class='adjacent'
+      id="gainButton"></span>
+  </div>
+  <div id="envelopes"></div>
+  <div id="transport"><span class='adjacent' id="renderButton"></span><span class='adjacent' id="playButton"></span><span class='adjacent' id="stopButton"></span><span class='adjacent' id="presets"></span><span class='adjacent' id="bookmarkButton"></span><span
+      class='adjacent' id="downloadButton"></span>
+  </div>
+  <div id="messagebox">
+    <span id="message">
+      This is my message
+    </span>
+    <span id="messageok"></span>
+  </div>
+  <div id="dialog" title="Help">
+    <div style="overflow:auto; font-size:70%; font-variant:none; letter-spacing: default; word-spacing: default;">
+      <p><b>Conceptular Beat Synthesiser </b> is a drum machine powered by machine learning.
+        There are no samples, instead the system uses neural network models of sounds. Details of exactly how this works are in this paper: [insert paper link].</p>
+      <p>To use, create a sequence using the grid, set the envelope parameters, and press the <b>Render</b> button. The rendering process needs to use the computation power of your GPU, and may take some time. </p>
+      <p></p>
+      <p>The real power of this synthesiser lies in the way you can manipule the sound models using the envelopes. Each model has the following parameters:</p>
+      <p><b>Morph:</b> Each model is trained to reproduce two different sounds. You can morph between these.</p>
+      <p><b>Stretch:</b> This envelope will change the sound to play more quickly or slowly, but will not change the pitch. </p>
+      <p><b>Leak Rate:</b> This parameter changes the internal timing of the model. It tends to change the pitch of the sound but may have more unpredicable effects.</p>
+      <p><b>Excite:</b> Raising this parameter will make each model behave in more unpredictable ways, while lowering it will make the sound softer.</p>
+      <p><b>Gain:</b> This controls the volume of the sound.</p>
+      <p></p>
+      <p>The <b>Share</b> button will create a link to your sound that you can access another time, and also share with others.</p>
+      <p>The <b>Download</b> button saves the sound onto your computer.</p>
+
+    </div>
+  </div>
+</body>
+
+</html>
